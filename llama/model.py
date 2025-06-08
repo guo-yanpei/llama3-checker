@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
+from copy import deepcopy
 import torch.nn.functional as F
 from fairscale.nn.model_parallel.layers import (
     ColumnParallelLinear,
@@ -15,10 +16,13 @@ from fairscale.nn.model_parallel.layers import (
 )
 from torch import nn
 
+class ColumnParalelChecker:
+    def __init__(self):
+        pass
 
 @dataclass
 class ModelArgs:
-    dim: int = 4096
+    dim: int = 4096 # embedding size
     n_layers: int = 32
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
@@ -31,7 +35,6 @@ class ModelArgs:
     max_batch_size: int = 32
     max_seq_len: int = 2048
 
-
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -41,15 +44,24 @@ class RMSNorm(torch.nn.Module):
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
+    def copy_to_cpu(self):
+        self.weight_cpu = deepcopy(self.weight).cpu()
+
+    def check(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight_cpu
+
     def forward(self, x):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
-
+# Compute rotary matrix
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+    # outer product or tensor product of vector t and freqs
     freqs = torch.outer(t, freqs)
+    # freqs_cis[x, y] = exp(i * freqs[x, y])
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
@@ -85,7 +97,6 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .expand(bs, slen, n_kv_heads, n_rep, head_dim)
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
-
 
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
@@ -142,6 +153,19 @@ class Attention(nn.Module):
                 self.head_dim,
             )
         ).cuda()
+    
+    def copy_to_cpu(self):
+        return
+
+    def check(
+        self,
+        # x: torch.Tensor,
+        # start_pos: int,
+        # freqs_cis: torch.Tensor,
+        # mask: Optional[torch.Tensor],
+        index: int
+    ):
+        return self.wo_cpu[index]
 
     def forward(
         self,
@@ -186,8 +210,16 @@ class Attention(nn.Module):
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-        return self.wo(output)
+
+        wo = self.wo(output)
+        try:
+            self.wo_cpu
+            self.wo_cpu.append(deepcopy(wo).cpu())
+        except AttributeError:
+            self.wo_cpu = [deepcopy(wo).cpu()]
+        return wo
 
 
 class FeedForward(nn.Module):
@@ -215,9 +247,30 @@ class FeedForward(nn.Module):
             dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
 
-    def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+    def copy_to_cpu(self):
+        self.w1_cpu = deepcopy(self.w1).cpu()
+        self.w2_cpu = deepcopy(self.w2).cpu()
+        self.w3_cpu = deepcopy(self.w3).cpu()
+        return
 
+    def forward(self, x):
+        w1x = self.w1(x)
+        w3x = self.w3(x)
+        w2x = self.w2(F.silu(w1x) * w3x)
+        
+        try:
+            self.w1x_cpu
+            self.w1x_cpu.append(w1x.cpu())
+            self.w2x_cpu.append(deepcopy(w2x).cpu())
+            self.w3x_cpu.append(w3x.cpu())
+        except AttributeError:
+            self.w1x_cpu = [w1x.cpu()]
+            self.w2x_cpu = [deepcopy(w2x).cpu()]
+            self.w3x_cpu = [w3x.cpu()]
+        return w2x
+
+    def check(self, x, index):
+        return self.w2x_cpu[index]
 
 class TransformerBlock(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
@@ -235,6 +288,24 @@ class TransformerBlock(nn.Module):
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+    
+    def copy_to_cpu(self):
+        self.attention.copy_to_cpu()
+        self.feed_forward.copy_to_cpu()
+        self.attention_norm.copy_to_cpu()
+        self.ffn_norm.copy_to_cpu()
+
+    def check(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        index: int,
+    ):
+        h = x + self.attention.check(index)
+        out = h + self.feed_forward.check(self.ffn_norm.check(h), index)
+        return out
 
     def forward(
         self,
@@ -246,7 +317,6 @@ class TransformerBlock(nn.Module):
         h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
-
 
 class Transformer(nn.Module):
     def __init__(self, params: ModelArgs):
@@ -268,11 +338,45 @@ class Transformer(nn.Module):
             params.dim, params.vocab_size, bias=False, init_method=lambda x: x
         )
 
+        # Rotary Positional Embedding   
         self.freqs_cis = precompute_freqs_cis(
             params.dim // params.n_heads,
             params.max_seq_len * 2,
             params.rope_theta,
         )
+    
+    def copy_to_cpu(self):
+        self.tok_embeddings_cpu = deepcopy(self.tok_embeddings).cpu()
+        for layer in self.layers:
+            layer.copy_to_cpu()
+        self.norm.copy_to_cpu()
+    
+    def check_forward(self, tokens: torch.Tensor, start_pos: int, index: int):
+        _bsz, seqlen = tokens.shape
+        h = self.tok_embeddings_cpu(tokens)
+        self.freqs_cis = self.freqs_cis.to(h.device)
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+
+        mask = None
+        if seqlen > 1:
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
+
+            mask = torch.triu(mask, diagonal=1)
+
+            # When performing key-value caching, we compute the attention scores
+            # only for the new sequence. Thus, the matrix of scores is of size
+            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+            # j > cache_len + i, since row i corresponds to token cache_len + i.
+            mask = torch.hstack(
+                [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
+            ).type_as(h)
+
+        for layer in self.layers:
+            h = layer.check(h, start_pos, freqs_cis, mask, index)
+        h = self.norm.check(h)
+        print("almost reach end")
+        # output = self.output(h).float()
+        return
 
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):

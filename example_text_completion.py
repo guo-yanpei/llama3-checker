@@ -11,7 +11,7 @@ from llama import Llama
 def main(
     ckpt_dir: str,
     tokenizer_path: str,
-    temperature: float = 0.6,
+    temperature: float = 0,
     top_p: float = 0.9,
     max_seq_len: int = 128,
     max_gen_len: int = 64,
@@ -48,6 +48,7 @@ def main(
         plush girafe => girafe peluche
         cheese =>""",
     ]
+    print("start inferring")
     results = generator.text_completion(
         prompts,
         max_gen_len=max_gen_len,
@@ -59,6 +60,14 @@ def main(
         print(f"> {result['generation']}")
         print("\n==================================\n")
 
+    print("start checking")
+    generator.text_checker(
+        prompts,
+        max_gen_len=max_gen_len,
+        temperature=temperature,
+        top_p=top_p,
+    )
+    print("finish checking")
 
 if __name__ == "__main__":
     fire.Fire(main)
