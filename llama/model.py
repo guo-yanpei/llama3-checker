@@ -4,9 +4,10 @@
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
-
+import random
 import fairscale.nn.model_parallel.initialize as fs_init
 import torch
+from copy import deepcopy
 import torch.nn.functional as F
 from fairscale.nn.model_parallel.layers import (
     ColumnParallelLinear,
@@ -15,10 +16,46 @@ from fairscale.nn.model_parallel.layers import (
 )
 from torch import nn
 
+class LinearChecker:
+    def __init__(self, is_col: bool):
+        self.is_col = is_col
+
+    def copy_to_cpu(self, weight: torch.tensor):
+        self.weight = weight.cpu().t().float()
+
+    def linear_output(self, output: torch.tensor):
+        try:
+            self.output
+            self.output.append(output.cpu().clone().detach())
+        except AttributeError:
+            self.output = [output.cpu().clone().detach()]
+    
+    def check(self, input: torch.tensor, index: int):
+        input_flat = input.view(-1, input.size(-1)).float().clone()
+        output_flat = self.output[index].view(-1, self.output[index].size(-1)).float()
+        _, p = self.weight.shape
+
+        # r = [random.randint(0, 1) for _ in range(p)]
+        # Br = torch.zeros(m, dtype=torch.float, device="cpu")
+        # Cr = torch.zeros(n, dtype=torch.float, device="cpu")
+        # for i in range(p):
+        #     if r[i] == 1:
+        #         Br += self.weight[:, i]
+        #         Cr += output_flat[:, i]
+        # ABr = input_flat @ Br
+        try:
+            self.r
+        except AttributeError:
+            self.r = torch.randint(0, 2, (p, 1), dtype=torch.float, device="cpu") 
+            self.Br = self.weight @ self.r
+        ABr = input_flat @ self.Br
+        Cr = output_flat @ self.r
+        assert torch.allclose(ABr, Cr, rtol=1e-2, atol=1e-4), f"index: {index}"
+        return self.output[index]
 
 @dataclass
 class ModelArgs:
-    dim: int = 4096
+    dim: int = 4096 # embedding size
     n_layers: int = 32
     n_heads: int = 32
     n_kv_heads: Optional[int] = None
@@ -31,7 +68,6 @@ class ModelArgs:
     max_batch_size: int = 32
     max_seq_len: int = 2048
 
-
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
@@ -41,15 +77,24 @@ class RMSNorm(torch.nn.Module):
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
+    def copy_to_cpu(self):
+        self.weight_cpu = deepcopy(self.weight).cpu()
+
+    def check(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight_cpu
+
     def forward(self, x):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
-
+# Compute rotary matrix
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
     t = torch.arange(end, device=freqs.device, dtype=torch.float32)
+    # outer product or tensor product of vector t and freqs
     freqs = torch.outer(t, freqs)
+    # freqs_cis[x, y] = exp(i * freqs[x, y])
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
     return freqs_cis
 
@@ -86,7 +131,6 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
         .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
     )
 
-
 class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
@@ -104,6 +148,7 @@ class Attention(nn.Module):
             gather_output=False,
             init_method=lambda x: x,
         )
+        self.wq_checker = LinearChecker(True)
         self.wk = ColumnParallelLinear(
             args.dim,
             self.n_kv_heads * self.head_dim,
@@ -111,6 +156,7 @@ class Attention(nn.Module):
             gather_output=False,
             init_method=lambda x: x,
         )
+        self.wk_checker = LinearChecker(True)
         self.wv = ColumnParallelLinear(
             args.dim,
             self.n_kv_heads * self.head_dim,
@@ -118,6 +164,7 @@ class Attention(nn.Module):
             gather_output=False,
             init_method=lambda x: x,
         )
+        self.wv_checker = LinearChecker(True)
         self.wo = RowParallelLinear(
             args.n_heads * self.head_dim,
             args.dim,
@@ -125,6 +172,7 @@ class Attention(nn.Module):
             input_is_parallel=True,
             init_method=lambda x: x,
         )
+        self.wo_checker = LinearChecker(False)
 
         self.cache_k = torch.zeros(
             (
@@ -134,6 +182,14 @@ class Attention(nn.Module):
                 self.head_dim,
             )
         ).cuda()
+        self.cache_k_checker = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            )
+        ).cpu()
         self.cache_v = torch.zeros(
             (
                 args.max_batch_size,
@@ -142,6 +198,70 @@ class Attention(nn.Module):
                 self.head_dim,
             )
         ).cuda()
+        self.cache_v_checker = torch.zeros(
+            (
+                args.max_batch_size,
+                args.max_seq_len,
+                self.n_local_kv_heads,
+                self.head_dim,
+            )
+        ).cpu()
+    
+    def copy_to_cpu(self):
+        self.wq_checker.copy_to_cpu(self.wq.weight)
+        self.wk_checker.copy_to_cpu(self.wk.weight)
+        self.wv_checker.copy_to_cpu(self.wv.weight)
+        self.wo_checker.copy_to_cpu(self.wo.weight)
+        return
+
+    def check(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        index: int
+    ):
+        bsz, seqlen, _ = x.shape
+        xq = self.wq_checker.check(x, index)
+        xk = self.wk_checker.check(x, index)
+        xv = self.wv_checker.check(x, index)
+
+        xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
+
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+
+        self.cache_k_checker = self.cache_k_checker.to(xq)
+        self.cache_v_checker = self.cache_v_checker.to(xq)
+
+        self.cache_k_checker[:bsz, start_pos : start_pos + seqlen] = xk
+        self.cache_v_checker[:bsz, start_pos : start_pos + seqlen] = xv
+
+        keys = self.cache_k_checker[:bsz, : start_pos + seqlen]
+        values = self.cache_v_checker[:bsz, : start_pos + seqlen]
+        
+        keys = repeat_kv(
+            keys, self.n_rep
+        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+        values = repeat_kv(
+            values, self.n_rep
+        )  # (bs, cache_len + seqlen, n_local_heads, head_dim)
+
+        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+        keys = keys.transpose(1, 2)  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        values = values.transpose(
+            1, 2
+        )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
+        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if mask is not None:
+            scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        output = torch.matmul(scores, values)
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        
+        return self.wo_checker.check(output, index)
 
     def forward(
         self,
@@ -151,7 +271,12 @@ class Attention(nn.Module):
         mask: Optional[torch.Tensor],
     ):
         bsz, seqlen, _ = x.shape
-        xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+        xq = self.wq(x)
+        self.wq_checker.linear_output(xq)
+        xk = self.wk(x)
+        self.wk_checker.linear_output(xk)
+        xv = self.wv(x)
+        self.wv_checker.linear_output(xv)
 
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
@@ -181,13 +306,30 @@ class Attention(nn.Module):
         values = values.transpose(
             1, 2
         )  # (bs, n_local_heads, cache_len + seqlen, head_dim)
-        scores = torch.matmul(xq, keys.transpose(2, 3)) / math.sqrt(self.head_dim)
+        
+        tmp = torch.matmul(xq, keys.transpose(2, 3))
+        try:
+            self.tmps
+            self.tmps.append(tmp.clone().detach().cpu())
+        except AttributeError:
+            self.tmps = [tmp.clone().detach().cpu()]
+        scores = tmp / math.sqrt(self.head_dim)
         if mask is not None:
             scores = scores + mask  # (bs, n_local_heads, seqlen, cache_len + seqlen)
         scores = F.softmax(scores.float(), dim=-1).type_as(xq)
         output = torch.matmul(scores, values)  # (bs, n_local_heads, seqlen, head_dim)
+        try:
+            self.outputs
+            self.outputs.append(output.clone().detach().cpu())
+        except AttributeError:
+            self.outputs = [output.clone().detach().cpu()]
+
+        # print(xq.shape, keys.shape, scores.shape, values.shape)
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
-        return self.wo(output)
+
+        wo = self.wo(output)
+        self.wo_checker.linear_output(wo)
+        return wo
 
 
 class FeedForward(nn.Module):
@@ -208,16 +350,38 @@ class FeedForward(nn.Module):
         self.w1 = ColumnParallelLinear(
             dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
+        self.w1_checker = LinearChecker(True)
         self.w2 = RowParallelLinear(
             hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
         )
+        self.w2_checker = LinearChecker(False)
         self.w3 = ColumnParallelLinear(
             dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
         )
+        self.w3_checker = LinearChecker(True)
+
+    def copy_to_cpu(self):
+        self.w1_checker.copy_to_cpu(self.w1.weight)
+        self.w2_checker.copy_to_cpu(self.w2.weight)
+        self.w3_checker.copy_to_cpu(self.w3.weight)
+        return
 
     def forward(self, x):
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
+        w1x = self.w1(x)
+        w3x = self.w3(x)
+        w2x = self.w2(F.silu(w1x) * w3x)
+        
+        self.w1_checker.linear_output(w1x)
+        self.w3_checker.linear_output(w3x)
+        self.w2_checker.linear_output(w2x)
+        return w2x
 
+    def check(self, x, index):
+        w1x = self.w1_checker.check(x, index)
+        w3x = self.w3_checker.check(x, index)
+        
+        w2x = self.w2_checker.check(F.silu(w1x) * w3x, index)
+        return w2x
 
 class TransformerBlock(nn.Module):
     def __init__(self, layer_id: int, args: ModelArgs):
@@ -235,6 +399,24 @@ class TransformerBlock(nn.Module):
         self.layer_id = layer_id
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
+    
+    def copy_to_cpu(self):
+        self.attention.copy_to_cpu()
+        self.feed_forward.copy_to_cpu()
+        self.attention_norm.copy_to_cpu()
+        self.ffn_norm.copy_to_cpu()
+
+    def check(
+        self,
+        x: torch.Tensor,
+        start_pos: int,
+        freqs_cis: torch.Tensor,
+        mask: Optional[torch.Tensor],
+        index: int,
+    ):
+        h = x + self.attention.check(self.attention_norm.check(x), start_pos, freqs_cis, mask, index)
+        out = h + self.feed_forward.check(self.ffn_norm.check(h), index)
+        return out
 
     def forward(
         self,
@@ -246,7 +428,6 @@ class TransformerBlock(nn.Module):
         h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
-
 
 class Transformer(nn.Module):
     def __init__(self, params: ModelArgs):
@@ -267,12 +448,47 @@ class Transformer(nn.Module):
         self.output = ColumnParallelLinear(
             params.dim, params.vocab_size, bias=False, init_method=lambda x: x
         )
+        self.output_checker = LinearChecker(True)
 
+        # Rotary Positional Embedding   
         self.freqs_cis = precompute_freqs_cis(
             params.dim // params.n_heads,
             params.max_seq_len * 2,
             params.rope_theta,
         )
+    
+    def copy_to_cpu(self):
+        self.tok_embeddings_cpu = deepcopy(self.tok_embeddings).cpu()
+        for layer in self.layers:
+            layer.copy_to_cpu()
+        self.norm.copy_to_cpu()
+        self.output_checker.copy_to_cpu(self.output.weight)
+    
+    def check_forward(self, tokens: torch.Tensor, start_pos: int, index: int):
+        _bsz, seqlen = tokens.shape
+        h = self.tok_embeddings_cpu(tokens)
+        self.freqs_cis = self.freqs_cis.to(h.device)
+        freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+
+        mask = None
+        if seqlen > 1:
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=tokens.device)
+
+            mask = torch.triu(mask, diagonal=1)
+
+            # When performing key-value caching, we compute the attention scores
+            # only for the new sequence. Thus, the matrix of scores is of size
+            # (seqlen, cache_len + seqlen), and the only masked entries are (i, j) for
+            # j > cache_len + i, since row i corresponds to token cache_len + i.
+            mask = torch.hstack(
+                [torch.zeros((seqlen, start_pos), device=tokens.device), mask]
+            ).type_as(h)
+
+        for layer in self.layers:
+            h = layer.check(h, start_pos, freqs_cis, mask, index)
+        h = self.norm.check(h)
+        output = self.output_checker.check(h, index).float()
+        return output
 
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
@@ -299,4 +515,5 @@ class Transformer(nn.Module):
             h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)
         output = self.output(h).float()
+        self.output_checker.linear_output(output)
         return output

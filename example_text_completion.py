@@ -5,13 +5,14 @@ from typing import List
 
 import fire
 
+import torch
 from llama import Llama
-
+import time
 
 def main(
     ckpt_dir: str,
     tokenizer_path: str,
-    temperature: float = 0.6,
+    temperature: float = 0,
     top_p: float = 0.9,
     max_seq_len: int = 128,
     max_gen_len: int = 64,
@@ -48,6 +49,8 @@ def main(
         plush girafe => girafe peluche
         cheese =>""",
     ]
+    print("start inferring")
+    start_time = time.time()
     results = generator.text_completion(
         prompts,
         max_gen_len=max_gen_len,
@@ -59,6 +62,21 @@ def main(
         print(f"> {result['generation']}")
         print("\n==================================\n")
 
+    print(f"finish inferring in {time.time() - start_time} seconds")
+    torch.set_num_threads(1)
+    print("start checking")
+    start_time = time.time()
+    results = generator.text_checker(
+        prompts,
+        max_gen_len=max_gen_len,
+        temperature=temperature,
+        top_p=top_p,
+    )
+    for prompt, result in zip(prompts, results):
+        print(prompt)
+        print(f"> {result['generation']}")
+        print("\n==================================\n")
+    print(f"finish checking in {time.time() - start_time} seconds")
 
 if __name__ == "__main__":
     fire.Fire(main)

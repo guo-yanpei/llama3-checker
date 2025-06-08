@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+Meta-Llama-3-8B-Instruct
 
 # C extensions
 *.so

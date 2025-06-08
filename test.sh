@@ -1,0 +1,1 @@
+torchrun --nproc_per_node 1 --master_port 29510 example_text_completion.py  --ckpt_dir Meta-Llama-3-8B-Instruct/original/     --tokenizer_path Meta-Llama-3-8B-Instruct/original/tokenizer.model     --max_seq_len 512 --max_batch_size 6
