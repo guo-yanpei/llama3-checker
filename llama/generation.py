@@ -144,7 +144,6 @@ class Llama:
         Note:
             This method uses the provided prompts as a basis for generating text. It employs nucleus sampling to produce text with controlled randomness.
             If logprobs is True, token log probabilities are computed for each generated token.
-
         """
         params = self.model.params
         bsz = len(prompt_tokens)
@@ -238,12 +237,7 @@ class Llama:
 
         for index, cur_pos in enumerate(range(min_prompt_len, total_len)):
             logits = self.model.check_forward(tokens[:, prev_pos:cur_pos], prev_pos, index)
-            return
-            if temperature > 0:
-                probs = torch.softmax(logits[:, -1] / temperature, dim=-1)
-                next_token = sample_top_p(probs, top_p)
-            else:
-                next_token = torch.argmax(logits[:, -1], dim=-1)
+            next_token = torch.argmax(logits[:, -1], dim=-1) # -1 represents flatten
 
             next_token = next_token.reshape(-1)
             # only replace token if prompt has already been generated
@@ -258,6 +252,28 @@ class Llama:
             if all(eos_reached):
                 break
 
+        if logprobs:
+            token_logprobs = token_logprobs.tolist()
+        out_tokens, out_logprobs = [], []
+
+        # convert tokens to string
+        for i, toks in enumerate(tokens.tolist()):
+            # cut to max gen len
+            start = 0 if echo else len(prompt_tokens[i])
+            toks = toks[start : len(prompt_tokens[i]) + max_gen_len]
+            probs = None
+            # cut to after eos tok if any
+            for stop_token in self.tokenizer.stop_tokens:
+                try:
+                    eos_idx = toks.index(stop_token)
+                    toks = toks[:eos_idx]
+                    probs = probs[:eos_idx] if logprobs else None
+                except ValueError:
+                    pass
+            out_tokens.append(toks)
+            out_logprobs.append(probs)
+        return (out_tokens, out_logprobs if logprobs else None)
+
     def text_checker(
         self,
         prompts: List[str],
@@ -270,8 +286,7 @@ class Llama:
         if max_gen_len is None:
             max_gen_len = self.model.params.max_seq_len - 1
         prompt_tokens = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
-        # generation_tokens, generation_logprobs = 
-        self.check(
+        generation_tokens, generation_logprobs = self.check(
             prompt_tokens=prompt_tokens,
             max_gen_len=max_gen_len,
             temperature=temperature,
@@ -279,7 +294,15 @@ class Llama:
             logprobs=logprobs,
             echo=echo,
         )
-        return
+        if logprobs:
+            return [
+                {
+                    "generation": self.tokenizer.decode(t),
+                    "tokens": [self.tokenizer.decode([x]) for x in t],
+                    "logprobs": logprobs_i,
+                }
+                for t, logprobs_i in zip(generation_tokens, generation_logprobs)
+            ]
         return [{"generation": self.tokenizer.decode(t)} for t in generation_tokens]
 
     def text_completion(

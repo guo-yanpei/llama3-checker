@@ -61,12 +61,16 @@ def main(
         print("\n==================================\n")
 
     print("start checking")
-    generator.text_checker(
+    results = generator.text_checker(
         prompts,
         max_gen_len=max_gen_len,
         temperature=temperature,
         top_p=top_p,
     )
+    for prompt, result in zip(prompts, results):
+        print(prompt)
+        print(f"> {result['generation']}")
+        print("\n==================================\n")
     print("finish checking")
 
 if __name__ == "__main__":

@@ -20,6 +20,19 @@ class ColumnParalelChecker:
     def __init__(self):
         pass
 
+class LinearChecker:
+    def __init__(self, weight_dim: int):
+        self.weight = weight
+
+    def copy_to_cpu(self, weight: torch.tensor):
+        self.weight = deepcopy(weight).cpu()
+
+    def linear_output(self, output: torch.tensor):
+        self.output = deepcopy(output).cpu()
+    
+    def check(self, input: torch.tensor):
+        return
+
 @dataclass
 class ModelArgs:
     dim: int = 4096 # embedding size
@@ -374,9 +387,8 @@ class Transformer(nn.Module):
         for layer in self.layers:
             h = layer.check(h, start_pos, freqs_cis, mask, index)
         h = self.norm.check(h)
-        print("almost reach end")
-        # output = self.output(h).float()
-        return
+        output = self.output(h).float()
+        return output
 
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
@@ -402,5 +414,7 @@ class Transformer(nn.Module):
         for layer in self.layers:
             h = layer(h, start_pos, freqs_cis, mask)
         h = self.norm(h)
+        print(f"h shape: {h.shape}, weight shape: {self.output.weight.shape}")
         output = self.output(h).float()
+        print(f"output shape: {output.shape}")
         return output
